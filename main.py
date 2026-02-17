@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, conint, confloat
 # -------------------------
 Preference = Literal["FASTEST", "LOW_FUEL", "CHEAPEST", "SHORT_DISTANCE"]
 
-OSRM_BASE_URL = os.getenv("OSRM_BASE_URL", "http://localhost:5000")
+OSRM_BASE_URL = os.getenv("OSRM_BASE_URL", "https://osrm-popayan-production.up.railway.app")
 
 DEFAULT_FUEL_L_PER_100KM = float(os.getenv("FUEL_L_PER_100KM", "7.5"))
 DEFAULT_FUEL_PRICE_PER_LITER = int(os.getenv("FUEL_PRICE_PER_LITER", "15000"))  # COP
