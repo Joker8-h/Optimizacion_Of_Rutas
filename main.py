@@ -58,6 +58,50 @@ class RouteOptionsResponse(BaseModel):
 
 
 # -------------------------
+# Nuevos modelos para cobro por paradas
+# -------------------------
+
+class PassengerSegment(BaseModel):
+    """
+    Representa el tramo de un pasajero dentro de una ruta con paradas.
+    - start_index: índice de la parada donde se sube (0 = primera parada)
+    - end_index: índice de la parada donde se baja (debe ser > start_index)
+    - passenger_id: identificador opcional para relacionarlo con tu sistema
+    """
+
+    passenger_id: Any | None = None
+    start_index: conint(ge=0)
+    end_index: conint(ge=1)
+
+
+class SegmentFareRequest(BaseModel):
+    """
+    Request para calcular el valor a pagar de cada pasajero según las paradas.
+    - stops: lista de paradas ordenadas de inicio a fin
+    - total_route_price_cop: precio total que normalmente cobrarías por toda la ruta
+    - passengers: lista de pasajeros con su tramo dentro de la ruta
+    """
+
+    stops: List[LatLng] = Field(min_items=2, description="Paradas ordenadas de la ruta")
+    total_route_price_cop: conint(gt=0)
+    passengers: List[PassengerSegment] = Field(min_items=1)
+
+
+class PassengerFare(BaseModel):
+    passenger_id: Any | None
+    start_index: int
+    end_index: int
+    distance_km: float
+    fare_cop: int
+
+
+class SegmentFareResponse(BaseModel):
+    total_distance_km: float
+    total_route_price_cop: int
+    passengers: List[PassengerFare]
+
+
+# -------------------------
 # Helpers
 # -------------------------
 def estimate_fuel(distance_km: float, fuel_l_per_100km: float) -> float:
@@ -87,6 +131,39 @@ def osrm_get_routes(origin: LatLng, dest: LatLng) -> Dict[str, Any]:
     params = {
         "alternatives": "true",
         "overview": "full",
+        "geometries": "geojson",
+        "steps": "false",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
+
+    except requests.ConnectionError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"No hay conexión con OSRM en {OSRM_BASE_URL}. Verifica que OSRM esté activo.",
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"OSRM error: {str(e)}")
+
+
+def osrm_get_multi_route(stops: List[LatLng]) -> Dict[str, Any]:
+    """
+    Obtiene una ruta única pasando por todas las paradas en orden.
+    Aprovecha que OSRM permite varios puntos:
+    /route/v1/driving/long1,lat1;long2,lat2;long3,lat3;...
+    """
+
+    if len(stops) < 2:
+        raise HTTPException(status_code=400, detail="Se requieren al menos 2 paradas")
+
+    coords = ";".join(f"{s.lng},{s.lat}" for s in stops)
+    url = f"{OSRM_BASE_URL}/route/v1/driving/{coords}"
+    params = {
+        "alternatives": "false",
+        "overview": "false",
         "geometries": "geojson",
         "steps": "false",
     }
@@ -187,4 +264,91 @@ def route_options(req: RouteOptionsRequest):
         requested=req.k,
         returned=len(out),
         routes=out,
+    )
+
+
+@app.post("/segment-fares", response_model=SegmentFareResponse)
+def segment_fares(req: SegmentFareRequest):
+    """
+    Calcula cuánto debe pagar cada pasajero según las paradas en las que se sube/baja.
+
+    Lógica:
+    1. Se calcula la distancia total de la ruta usando todas las paradas.
+    2. Se obtiene la distancia entre cada par de paradas consecutivas (legs).
+    3. Para cada pasajero se suma la distancia de los legs entre start_index y end_index.
+    4. El valor que paga es proporcional a la distancia recorrida:
+       fare = total_route_price_cop * (dist_pax / dist_total)
+    """
+
+    if len(req.stops) < 2:
+        raise HTTPException(status_code=400, detail="Se requieren al menos 2 paradas")
+
+    # Validar índices de pasajeros
+    max_index = len(req.stops) - 1
+    for p in req.passengers:
+        if p.start_index < 0 or p.end_index <= p.start_index:
+            raise HTTPException(
+                status_code=400,
+                detail="Cada pasajero debe tener start_index >= 0 y end_index > start_index",
+            )
+        if p.end_index > max_index:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Los índices de paradas deben estar entre 0 y {max_index}",
+            )
+
+    data = osrm_get_multi_route(req.stops)
+    routes = data.get("routes", [])
+
+    if not routes:
+        raise HTTPException(status_code=404, detail="No se encontró ruta OSRM para las paradas dadas")
+
+    route = routes[0]
+    legs = route.get("legs")
+
+    if not legs:
+        raise HTTPException(
+            status_code=502,
+            detail="La respuesta de OSRM no contiene información de legs entre paradas",
+        )
+
+    # OSRM devuelve un leg por cada tramo entre paradas consecutivas
+    # distance viene en metros
+    leg_distances_km: List[float] = [(leg["distance"] or 0) / 1000.0 for leg in legs]
+
+    total_distance_km = sum(leg_distances_km)
+    if total_distance_km <= 0:
+        raise HTTPException(
+            status_code=502,
+            detail="La distancia total calculada es 0, no se puede repartir el precio",
+        )
+
+    passenger_fares: List[PassengerFare] = []
+
+    for p in req.passengers:
+        # Sumar distancia entre start_index y end_index
+        # Ejemplo: paradas [0,1,2,3], pasajero 1->3 => legs 1-2 y 2-3 => índices 1 y 2
+        seg_distance_km = sum(
+            leg_distances_km[i]
+            for i in range(p.start_index, p.end_index)
+            if 0 <= i < len(leg_distances_km)
+        )
+
+        proportion = seg_distance_km / total_distance_km
+        fare = int(round(req.total_route_price_cop * proportion))
+
+        passenger_fares.append(
+            PassengerFare(
+                passenger_id=p.passenger_id,
+                start_index=p.start_index,
+                end_index=p.end_index,
+                distance_km=round(seg_distance_km, 3),
+                fare_cop=fare,
+            )
+        )
+
+    return SegmentFareResponse(
+        total_distance_km=round(total_distance_km, 3),
+        total_route_price_cop=req.total_route_price_cop,
+        passengers=passenger_fares,
     )
